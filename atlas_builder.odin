@@ -44,14 +44,7 @@ ATLAS_PNG_OUTPUT_PATH :: "atlas.png"
 ATLAS_ODIN_OUTPUT_PATH :: "atlas.odin"
 
 // Set to false to not crop atlas after generation.
-ATLAS_CROP :: false
-
-// If you have a tileset (texture with tileset_) prefix, then this is says how many tiles wide it is
-TILESET_WIDTH :: 10
-TILESET_HEIGHT :: 12
-
-// The NxN pixel size of each tile.
-TILE_SIZE :: 16
+ATLAS_CROP :: true
 
 // for package line at top of atlas Odin metadata file
 PACKAGE_NAME :: "game"
@@ -87,11 +80,6 @@ Atlas_Texture_Rect :: struct {
 	duration:      f32,
 }
 
-Atlas_Tile_Rect :: struct {
-	rect:  Rect,
-	coord: Vec2i,
-}
-
 Texture_Data :: struct {
 	source_size:   Vec2i,
 	source_offset: Vec2i,
@@ -101,15 +89,6 @@ Texture_Data :: struct {
 	pixels_size:   Vec2i,
 	pixels:        []Color,
 	duration:      f32,
-	is_tile:       bool,
-	tile_coord:    Vec2i,
-}
-
-Tileset :: struct {
-	pixels:              []Color,
-	pixels_size:         Vec2i,
-	visible_pixels_size: Vec2i,
-	offset:              Vec2i,
 }
 
 Animation :: struct {
@@ -193,70 +172,6 @@ get_image_pixel :: proc(img: Image, x: int, y: int) -> Color {
 // and turns it from player_jump.png to Player_Jump.
 asset_name :: proc(path: string) -> string {
 	return fmt.tprintf("%s", strings.to_ada_case(slashpath.name(slashpath.base(path))))
-}
-
-// Loads a tileset. Currently only supports .ase tilesets
-load_tileset :: proc(filename: string, t: ^Tileset) {
-	data, data_ok := os.read_entire_file(filename)
-
-	if !data_ok {
-		log.error("Failed loading tileset", filename)
-		return
-	}
-
-	defer delete(data)
-	doc: ase.Document
-
-	umerr := ase.unmarshal(&doc, data[:])
-	if umerr != nil {
-		log.error("Aseprite unmarshal error", umerr)
-		return
-	}
-
-	defer ase.destroy_doc(&doc)
-
-	indexed := doc.header.color_depth == .Indexed
-	palette: ase.Palette_Chunk
-	if indexed {
-		for f in doc.frames {
-			for c in f.chunks {
-				if p, ok := c.(ase.Palette_Chunk); ok {
-					palette = p
-					break
-				}
-			}
-		}
-	}
-
-	if indexed && len(palette.entries) == 0 {
-		log.error("Document is indexed, but found no palette!")
-	}
-
-	for f in doc.frames {
-		for c in f.chunks {
-			#partial switch cv in c {
-			case ase.Cel_Chunk:
-				if cl, ok := cv.cel.(ase.Com_Image_Cel); ok {
-					if indexed {
-						t.pixels = make([]Color, int(cl.width) * int(cl.height))
-						for p, idx in cl.pixels {
-							if p == 0 {
-								continue
-							}
-
-							t.pixels[idx] = Color(palette.entries[u32(p)].color)
-						}
-					} else {
-						t.pixels = slice.clone(slice.reinterpret([]Color, cl.pixels))
-					}
-
-					t.offset = {int(cv.x), int(cv.y)}
-					t.pixels_size = {int(cl.width), int(cl.height)}
-					t.visible_pixels_size = {int(doc.header.width), int(doc.header.height)}
-				}
-			}
-		}
-	}
 }
 
 load_ase_texture_data :: proc(
@@ -533,20 +448,14 @@ main :: proc() {
 		return time.diff(i.creation_time, j.creation_time) > 0
 	})
 
-	tileset: Tileset
-
 	for fi in file_infos {
 		is_ase := strings.has_suffix(fi.name, ".ase") || strings.has_suffix(fi.name, ".aseprite")
 		is_png := strings.has_suffix(fi.name, ".png")
-		if is_ase || is_png {
-			path := fmt.tprintf("%s/%s", TEXTURES_DIR, fi.name)
-			if strings.has_prefix(fi.name, "tileset") {
-				load_tileset(path, &tileset)
-			} else if is_ase {
-				load_ase_texture_data(path, &textures, &animations)
-			} else if is_png {
-				load_png_texture_data(path, &textures)
-			}
+		path := fmt.tprintf("%s/%s", TEXTURES_DIR, fi.name)
+		if is_ase {
+			load_ase_texture_data(path, &textures, &animations)
+		} else if is_png {
+			load_png_texture_data(path, &textures)
 		}
 	}
 
@@ -558,7 +467,6 @@ main :: proc() {
 
 	PackRectType :: enum {
 		Texture,
-		Tile,
 		ShapesTexture,
 	}
 
@@ -569,19 +477,8 @@ main :: proc() {
 		return i32(t)
 	}
 
-	make_tile_id :: proc(x, y: int) -> i32 {
-		id: i32 = i32(x)
-		id <<= 13
-		return id | i32(y)
-	}
-
 	idx_from_rect_id :: proc(id: i32) -> int {
 		return int((u32(id) << 3) >> 3)
-	}
-
-	x_y_from_tile_id :: proc(id: i32) -> (x, y: int) {
-		id_type_stripped := idx_from_rect_id(id)
-		return int(id_type_stripped >> 13), int((u32(id_type_stripped) << 19) >> 19)
 	}
 
 	rect_id_type :: proc(i: i32) -> PackRectType {
@@ -599,48 +496,6 @@ main :: proc() {
 		)
 	}
 
-	if tileset.pixels_size.x != 0 && tileset.pixels_size.y != 0 {
-		h := tileset.pixels_size.y / TILE_SIZE
-		w := tileset.pixels_size.x / TILE_SIZE
-		top_left := -tileset.offset
-
-		t_img := Image {
-			data   = tileset.pixels,
-			width  = tileset.pixels_size.x,
-			height = tileset.pixels_size.y,
-		}
-
-		for x in 0 ..< w {
-			for y in 0 ..< h {
-				tx := TILE_SIZE * x + top_left.x
-				ty := TILE_SIZE * y + top_left.y
-
-				all_blank := true
-				txx_loop: for txx in tx ..< tx + TILE_SIZE {
-					for tyy in ty ..< ty + TILE_SIZE {
-						if get_image_pixel(t_img, int(txx), int(tyy)) != {} {
-							all_blank = false
-							break txx_loop
-						}
-					}
-				}
-
-				if all_blank {
-					continue
-				}
-
-				append(
-					&pack_rects,
-					stbrp.Rect {
-						id = make_pack_rect_id(make_tile_id(x, y), .Tile),
-						w = TILE_SIZE + 2,
-						h = TILE_SIZE + 2,
-					},
-				)
-			}
-		}
-	}
-
 	append(&pack_rects, stbrp.Rect{id = make_pack_rect_id(0, .ShapesTexture), w = 11, h = 11})
 
 	rect_pack_res := stbrp.pack_rects(&rc, raw_data(pack_rects), i32(len(pack_rects)))
@@ -656,7 +511,6 @@ main :: proc() {
 		height = ATLAS_SIZE,
 	}
 	atlas_textures: [dynamic]Atlas_Texture_Rect
-	atlas_tiles: [dynamic]Atlas_Tile_Rect
 
 	shapes_texture_rect: Rect
 
@@ -697,31 +551,6 @@ main :: proc() {
 			}
 
 			append(&atlas_textures, ar)
-		case .Tile:
-			ix, iy := x_y_from_tile_id(rp.id)
-
-			x := TILE_SIZE * ix
-			y := TILE_SIZE * iy
-
-			top_left := -tileset.offset
-
-			t_img := Image {
-				data   = tileset.pixels,
-				width  = tileset.pixels_size.x,
-				height = tileset.pixels_size.y,
-			}
-
-			source := Rect{x + top_left.x, y + top_left.y, TILE_SIZE, TILE_SIZE}
-			dest := Rect{int(rp.x), int(rp.y), source.width, source.height}
-
-			draw_image(&atlas, t_img, source, {int(rp.x), int(rp.y)})
-
-			at := Atlas_Tile_Rect {
-				rect  = dest,
-				coord = {ix, iy},
-			}
-
-			append(&atlas_tiles, at)
 		}
 	}
 
@@ -906,35 +735,6 @@ main :: proc() {
 			a.repeat,
 			a.document_size.x,
 			a.document_size.y,
-		)
-	}
-
-	fmt.fprintln(f, "}\n")
-
-
-	fmt.fprintln(f, "// All these are pre-generated so you can save tile IDs to data without")
-	fmt.fprintln(f, "// worrying about their order changing later.")
-	fmt.fprintln(f, "Tile_Id :: enum {")
-	for y in 0 ..< TILESET_HEIGHT {
-		for x in 0 ..< TILESET_WIDTH {
-			fmt.fprintf(f, "\tT0Y%vX%v,\n", y, x)
-		}
-	}
-	fmt.fprintln(f, "}")
-	fmt.fprintln(f, "")
-
-	fmt.fprintln(f, "atlas_tiles := #partial [Tile_Id]Rect {")
-
-	for at in atlas_tiles {
-		fmt.fprintf(
-			f,
-			"\t.T0Y%vX%v = {{%v, %v, %v, %v}},\n",
-			at.coord.y,
-			at.coord.x,
-			at.rect.x,
-			at.rect.y,
-			at.rect.width,
-			at.rect.height,
 		)
 	}
 
